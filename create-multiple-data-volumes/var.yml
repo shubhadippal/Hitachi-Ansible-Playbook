@@ -4,15 +4,13 @@
 #Options for DRS: "true", "false"
 ################################################################################
 mcu_ldev:
- - "0-15,1"
- - "16-31,2"
+ - "4100-4127,0"
 rcu_ldev:
- - "0-15,1"
- - "16-31,2"
-mcu_capacity_saving: "disabled"
-rcu_capacity_saving: "disabled"
+ - "4100-4127,0"
+mcu_capacity_saving: "compression_deduplication"
+rcu_capacity_saving: "compression_deduplication"
 default_size: "100GB"
 ldev_name_prefix: "Data_Vols"
-mcu_DRS: "false"
-rcu_DRS: "false"
+mcu_DRS: "true"
+rcu_DRS: "true"
 
