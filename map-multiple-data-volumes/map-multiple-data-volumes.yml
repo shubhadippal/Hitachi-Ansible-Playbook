@@ -87,7 +87,7 @@
         state: present
         connection_info: "{{ secondary_connection_info }}"
         spec:
-          name: "SvolPortRemote1"
+          name: "SvolPortRemote"
           port_ids: ["{{ svolport }}"]
           host_mode: "LINUX"
           lun_paths: "{{ svol_lun_paths }}"
