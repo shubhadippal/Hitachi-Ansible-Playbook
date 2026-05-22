@@ -1,0 +1,352 @@
+---
+#########################################################################################################
+# Explanation: This playbook distributes LDEVs to ports and creates hostgroups either:
+# Per hostgroup (multipathing=Y) – same LDEV slice on all ports belonging to one host.
+#   hg_ldev_map = { host1: [4000..4031], host2: [4032..4063], ... }
+# Per port (multipathing=N) – unique LDEV slice per individual port.
+#   port_ldev_map = { CL1-A: [4000..4015], CL2-A: [4016..4031], ... }
+#
+# Uses hv_hg_bulk for parallel multi-port operations.
+#########################################################################################################
+- name: LDEV Distribution Playbook
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - var.yml
+
+  vars:
+    connection_info:
+      address: "{{ storage_address }}"
+      username: "{{ vault_storage_username }}"
+      password: "{{ vault_storage_secret }}"
+
+    secondary_connection_info:
+      address: "{{ secondary_storage_address }}"
+      username: "{{ vault_secondary_storage_username }}"
+      password: "{{ vault_secondary_storage_secret }}"
+
+  tasks:
+
+    # -----------------------------------------------------------------------
+    # 1. Parse and generate LDEV lists
+    # -----------------------------------------------------------------------
+    - name: Parse start and end of totalvols_range
+      set_fact:
+        totalvols_range_start: "{{ totalvols_range.split('-')[0] | trim | int }}"
+        totalvols_range_end:   "{{ totalvols_range.split('-')[1] | trim | int }}"
+
+    - name: Generate full LDEV list
+      set_fact:
+        ldevs: "{{ range(totalvols_range_start | int, (totalvols_range_end | int) + 1) | list }}"
+
+    - name: Convert port_wwn_map to structured dict
+      # Produces: { "CL1-A": ["10000090faf2e4fb", "host1"], ... }
+      set_fact:
+        structured_map: >-
+          {{ dict(port_wwn_map.keys() | zip(
+               port_wwn_map.values() | map('split', ',') | map('map', 'trim') | list
+             )) }}
+
+    - name: Calculate new LDEV range for svolportlocal
+      when: svolportlocal is defined
+      set_fact:
+        svolportlocal_range_start: "{{ (totalvols_range_end | int) + 1 }}"
+        svolportlocal_range_end:   "{{ (totalvols_range_end | int) + 1 + ((totalvols_range_end | int) - (totalvols_range_start | int)) }}"
+
+    - name: Generate LDEV list for svolportlocal
+      when: svolportlocal is defined
+      set_fact:
+        svolportlocal_ldevs: "{{ range(svolportlocal_range_start | int, (svolportlocal_range_end | int) + 1) | list }}"
+
+    # -----------------------------------------------------------------------
+    # 2. Pre-compute lun_paths lists via indexed set_fact loops
+    #    Produces: [{ldev: "4000", lun: "0"}, {ldev: "4001", lun: "1"}, ...]
+    # -----------------------------------------------------------------------
+    - name: Build svol_lun_paths
+      set_fact:
+        svol_lun_paths: "{{ svol_lun_paths | default([]) + [{'ldev': ldevs[idx] | string, 'lun': idx | string}] }}"
+      loop: "{{ range(ldevs | length) | list }}"
+      loop_control:
+        loop_var: idx
+
+    - name: Build svollocal_lun_paths
+      when: svolportlocal is defined
+      set_fact:
+        svollocal_lun_paths: "{{ svollocal_lun_paths | default([]) + [{'ldev': svolportlocal_ldevs[idx] | string, 'lun': idx | string}] }}"
+      loop: "{{ range(svolportlocal_ldevs | length) | list }}"
+      loop_control:
+        loop_var: idx
+
+    # -----------------------------------------------------------------------
+    # 3. svolport — maps full ldev range to one port on secondary storage
+    # -----------------------------------------------------------------------
+    - name: Create hostgroup for svolport on secondary storage
+      when: svolport is defined
+      hitachivantara.vspone_block.vsp.hv_hg_bulk:
+        state: present
+        connection_info: "{{ secondary_connection_info }}"
+        spec:
+          name: "SvolPortRemote1"
+          port_ids: ["{{ svolport }}"]
+          host_mode: "LINUX"
+          lun_paths: "{{ svol_lun_paths }}"
+      register: result_svol
+
+    # -----------------------------------------------------------------------
+    # 4. svolportlocal — maps next ldev range to one port on primary storage
+    # -----------------------------------------------------------------------
+    - name: Create hostgroup for svolportlocal on primary storage
+      when: svolportlocal is defined
+      hitachivantara.vspone_block.vsp.hv_hg_bulk:
+        state: present
+        connection_info: "{{ connection_info }}"
+        spec:
+          name: "SvolPortLocal"
+          port_ids: ["{{ svolportlocal }}"]
+          host_mode: "LINUX"
+          lun_paths: "{{ svollocal_lun_paths }}"
+      register: result_svollocal
+
+    # -----------------------------------------------------------------------
+    # 5. Group ports by hostgroup name
+    # -----------------------------------------------------------------------
+    - name: Group ports by hostgroup name
+      set_fact:
+        hostgroup_ports: >-
+          {{ hostgroup_ports | default({}) | combine({
+               structured_map[item][1]:
+                 (hostgroup_ports | default({})).get(structured_map[item][1], []) + [item]
+             }) }}
+      loop: "{{ structured_map.keys() | list }}"
+
+    # -----------------------------------------------------------------------
+    # 6. Multipathing=Y — compute LDEV slices per hostgroup
+    # -----------------------------------------------------------------------
+    - name: Compute hg_ldev_map (multipathing=Y)
+      when: multipathing == "Y"
+      set_fact:
+        hg_ldev_map: >-
+          {{ dict(
+               hostgroup_ports.keys() | zip(
+                 ldevs | batch(ldevs | length // (hostgroup_ports | length)) | list
+               )
+             ) }}
+
+    # Build per-hostgroup lun_paths.
+    # Strategy: loop over hostgroup names; for each, append one dict per ldev index.
+    # We iterate over ldev indices using a second task that loops over the
+    # pre-computed hg_ldev_map values — one task invocation per (hg, ldev) pair.
+    # We generate the flat pair list purely with Jinja2 using a namespace trick:
+    # query('hg_name', idx) pairs via subelements on a helper structure.
+
+    - name: Build helper list-of-lists for hg ldev pairs (multipathing=Y)
+      when: multipathing == "Y"
+      # Produces hg_ldev_pairs: [ ["host1",0], ["host1",1], ..., ["host2",0], ... ]
+      set_fact:
+        hg_ldev_pairs: >-
+          {%- set pairs = [] -%}
+          {%- for hg_name in hostgroup_ports.keys() -%}
+            {%- for idx in range(hg_ldev_map[hg_name] | length) -%}
+              {%- set _ = pairs.append([hg_name, idx]) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ pairs }}
+
+    - name: Init hg_lun_paths_map (multipathing=Y)
+      when: multipathing == "Y"
+      set_fact:
+        hg_lun_paths_map: {}
+
+    - name: Build hg_lun_paths_map from pairs (multipathing=Y)
+      when: multipathing == "Y"
+      set_fact:
+        hg_lun_paths_map: >-
+          {{ hg_lun_paths_map | combine({
+               pair[0]: (hg_lun_paths_map.get(pair[0], []) +
+                         [{'ldev': hg_ldev_map[pair[0]][pair[1]] | string,
+                           'lun':  pair[1] | string}])
+             }) }}
+      loop: "{{ hg_ldev_pairs }}"
+      loop_control:
+        loop_var: pair
+
+    # -----------------------------------------------------------------------
+    # 7. Create hostgroups (multipathing=Y)
+    #    One hv_hg_bulk call per unique hostgroup — all its ports run in parallel.
+    #    WWNs: one entry per port, nickname = hg_name_portname
+    # -----------------------------------------------------------------------
+    - name: Create hostgroups in bulk (multipathing=Y)
+      when: multipathing == "Y"
+      vars:
+        hg_ports: "{{ hostgroup_ports[item] }}"
+        # Build [{wwn: "...", nickname: "hg_port"}, ...] — one per port in this hg
+        hg_wwns: >-
+          {%- set result = [] -%}
+          {%- for port in hostgroup_ports[item] -%}
+            {%- set _ = result.append({'wwn': structured_map[port][0], 'nickname': item ~ '_' ~ port}) -%}
+          {%- endfor -%}
+          {{ result }}
+      hitachivantara.vspone_block.vsp.hv_hg_bulk:
+        state: present
+        connection_info: "{{ connection_info }}"
+        spec:
+          name: "{{ item }}"
+          port_ids: "{{ hostgroup_ports[item] }}"
+          host_mode: "LINUX"
+          wwns: "{{ hg_wwns }}"
+          lun_paths: "{{ hg_lun_paths_map[item] }}"
+      loop: "{{ hostgroup_ports.keys() | list }}"
+      register: result_multipath_y
+
+    # -----------------------------------------------------------------------
+    # 8. Multipathing=N — compute LDEV slices per port
+    # -----------------------------------------------------------------------
+    - name: Compute port_ldev_map (multipathing=N)
+      when: multipathing == "N"
+      set_fact:
+        port_ldev_map: >-
+          {{ dict(
+               structured_map.keys() | zip(
+                 ldevs | batch(ldevs | length // (structured_map | length)) | list
+               )
+             ) }}
+
+    - name: Build helper list-of-lists for port ldev pairs (multipathing=N)
+      when: multipathing == "N"
+      set_fact:
+        port_ldev_pairs: >-
+          {%- set pairs = [] -%}
+          {%- for port_name in structured_map.keys() -%}
+            {%- for idx in range(port_ldev_map[port_name] | length) -%}
+              {%- set _ = pairs.append([port_name, idx]) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ pairs }}
+
+    - name: Init port_lun_paths_map (multipathing=N)
+      when: multipathing == "N"
+      set_fact:
+        port_lun_paths_map: {}
+
+    - name: Build port_lun_paths_map from pairs (multipathing=N)
+      when: multipathing == "N"
+      set_fact:
+        port_lun_paths_map: >-
+          {{ port_lun_paths_map | combine({
+               pair[0]: (port_lun_paths_map.get(pair[0], []) +
+                         [{'ldev': port_ldev_map[pair[0]][pair[1]] | string,
+                           'lun':  pair[1] | string}])
+             }) }}
+      loop: "{{ port_ldev_pairs }}"
+      loop_control:
+        loop_var: pair
+
+    # -----------------------------------------------------------------------
+    # 9. Create hostgroups (multipathing=N)
+    #    One hv_hg_bulk call per port (each port gets its own LDEV slice).
+    # -----------------------------------------------------------------------
+    - name: Create hostgroups in bulk (multipathing=N)
+      when: multipathing == "N"
+      hitachivantara.vspone_block.vsp.hv_hg_bulk:
+        state: present
+        connection_info: "{{ connection_info }}"
+        spec:
+          name: "{{ structured_map[item][1] }}"
+          port_ids: ["{{ item }}"]
+          host_mode: "LINUX"
+          wwns:
+            - wwn: "{{ structured_map[item][0] }}"
+              nickname: "{{ structured_map[item][1] }}_{{ item }}"
+          lun_paths: "{{ port_lun_paths_map[item] }}"
+      loop: "{{ structured_map.keys() | list }}"
+      loop_control:
+        loop_var: item
+      register: result_multipath_n
+
+    # -----------------------------------------------------------------------
+    # 10. Report generation
+    # -----------------------------------------------------------------------
+    - name: Initialize LDEV distribution report
+      set_fact:
+        ldev_distribution_report: |
+          ===================== Host Group Creation and LUN Mapping Report ==================
+
+    - name: Determine remote SVOL storage SN
+      when: result_svol is defined and (result_svol.host_groups | default([])) | length > 0
+      set_fact:
+        svol_storage_sn: "{{ secondary_storage_serial }}"
+
+    - name: Determine local SVOL storage SN
+      when: result_svollocal is defined and (result_svollocal.host_groups | default([])) | length > 0
+      set_fact:
+        local_svol_storage_sn: "{{ storage_serial }}"
+
+    - name: Append remote SVOL section to report
+      when: result_svol is defined and (result_svol.host_groups | default([])) | length > 0
+      set_fact:
+        ldev_distribution_report: "{{ ldev_distribution_report }}\nSN: {{ svol_storage_sn }}\n==============\n{{ svol_output }}"
+      vars:
+        svol_output: |
+          {% for hg in result_svol.host_groups %}
+          {{ hg.port_id }} [{{ hg.host_group_name }}]: [ {% for lun in hg.lun_paths %}{{ lun.ldev_id }}{% if not loop.last %}, {% endif %}{% endfor %} ]
+          {% endfor %}
+
+    - name: Append local SVOL section to report
+      when: result_svollocal is defined and (result_svollocal.host_groups | default([])) | length > 0
+      set_fact:
+        ldev_distribution_report: "{{ ldev_distribution_report }}\nSN: {{ local_svol_storage_sn }}\n==============\n{{ svollocal_output }}"
+      vars:
+        svollocal_output: |
+          {% for hg in result_svollocal.host_groups %}
+          {{ hg.port_id }} [{{ hg.host_group_name }}]: [ {% for lun in hg.lun_paths %}{{ lun.ldev_id }}{% if not loop.last %}, {% endif %}{% endfor %} ]
+          {% endfor %}
+
+    - name: Determine multipath/non-multipath storage SN
+      set_fact:
+        multipath_storage_sn: >-
+          {{ storage_serial if (multipathing in ['Y','N'] and
+               (result_multipath_y.results | default([]) | length > 0 if multipathing == 'Y'
+                else result_multipath_n.results | default([]) | length > 0))
+             else 'UNKNOWN' }}
+
+    - name: Initialize multipath_output_report
+      set_fact:
+        multipath_output_report: ""
+
+    - name: Prepare multipath output report (multipathing=Y)
+      when: multipathing == "Y" and result_multipath_y is defined and (result_multipath_y.results | default([])) | length > 0
+      set_fact:
+        multipath_output_report: "{{ multipath_output_report }}\n{{ report_section }}"
+      vars:
+        report_section: |
+          {% for res in result_multipath_y.results %}
+          {% for hg in (res.host_groups | default([])) %}
+          {{ hg.port_id }} [{{ hg.host_group_name }}]: {{ hg.lun_paths | map(attribute='ldev_id') | list }}
+          {% endfor %}
+          {% endfor %}
+
+    - name: Prepare non-multipath output report (multipathing=N)
+      when: multipathing == "N" and result_multipath_n is defined and (result_multipath_n.results | default([])) | length > 0
+      set_fact:
+        multipath_output_report: "{{ multipath_output_report }}\n{{ report_section }}"
+      vars:
+        report_section: |
+          {% for res in result_multipath_n.results %}
+          {% for hg in (res.host_groups | default([])) %}
+          {{ hg.port_id }} [{{ hg.host_group_name }}]: {{ hg.lun_paths | map(attribute='ldev_id') | list }}
+          {% endfor %}
+          {% endfor %}
+
+    - name: Generate timestamp
+      set_fact:
+        report_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+
+    - name: Append multipath section to report
+      set_fact:
+        ldev_distribution_report: "{{ ldev_distribution_report }}\n\nSN: {{ multipath_storage_sn | trim }}\n==============\n{{ multipath_output_report | trim }}\n"
+
+    - name: Save report as artifact
+      set_stats:
+        data:
+          ldev_distribution_report: "{{ldev_distribution_report }}"
