@@ -123,8 +123,8 @@
         content: "{{ final_report }}"
         dest: "/tmp/ldev_creation_report_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.txt"
       register: report_file
-
-    - name: Inform user about report location
-      debug:
-        msg: "LDEV Creation Report written to {{ report_file.dest }}"
+    - name: Save report as artifact
+      set_stats:
+        data:
+          ldev_creation_report: "{{ final_report }}"
 
