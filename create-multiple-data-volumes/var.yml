@@ -4,9 +4,9 @@
 #Options for DRS: "true", "false"
 ################################################################################
 mcu_ldev:
- - "4100-4127,0"
+ - "4128-4163,0"
 rcu_ldev:
- - "4100-4127,0"
+ - "4128-4163,0"
 mcu_capacity_saving: "compression_deduplication"
 rcu_capacity_saving: "compression_deduplication"
 default_size: "100GB"
