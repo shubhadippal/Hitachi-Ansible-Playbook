@@ -1,7 +1,8 @@
 ###############################################################################
 #################HOST GROUP CREATE AND LUN PATH ADD SECTION####################
 ###############################################################################
-totalvols_range: "4164-4227" #Only P-Vol range is required
+#totalvols_range: "4164-4227" #Only P-Vol range is required
+totalvols_range: "4164-4195" #Only P-Vol range is required
 multipathing: "Y"  #  "Y|N"
 svolport: "CL5-A"  # If defined, maps the "totalvols_range" (e.g., 0–31) to the RCU
 #svolportlocal: "CL5-A"  # If specified, assigns the next range of the same LDEV set (e.g., 32–63) to the MCU, provided the volumes are already created
@@ -9,7 +10,7 @@ port_wwn_map:
   CL1-A: "10000090faf2e1fb,host1"
   CL4-A: "10000090faf2e1fa,host1"
   CL5-A: "100000109b582192,host2"
-  CL8-A: "100000109b582191,host2"
+  CL8-A: "100000109b584191,host2"
   CL1-D: "100000109b5b61d6,host3"
   CL2-D: "100000109b5b61d7,host3"
   CL3-D: "100000109b3ce1c0,host4"
