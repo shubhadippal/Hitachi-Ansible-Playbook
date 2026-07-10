@@ -4,7 +4,7 @@
 #Options for DRS: "true", "false"
 ################################################################################
 mcu_ldev:
- - "5000-5009,0"
+ - "5032-5063,0"
 mcu_capacity_saving: "compression_deduplication"
 default_size: "100GB"
 ldev_name_prefix: "Data_Vols"
