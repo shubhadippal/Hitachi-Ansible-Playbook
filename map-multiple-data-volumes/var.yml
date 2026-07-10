@@ -3,8 +3,8 @@
 ###############################################################################
 totalvols_range: "5032-5063" #Only P-Vol range is required
 multipathing: "Y"  #  "Y|N"
-svolport: "CL5-A"  # If defined, maps the "totalvols_range" (e.g., 0–31) to the RCU
-svolport_hg_name: "SvolHost"
+#svolport: "CL5-A"  # If defined, maps the "totalvols_range" (e.g., 0–31) to the RCU
+#svolport_hg_name: "SvolHost"
 #svolportlocal: "CL5-A"  # If specified, assigns the next range of the same LDEV set (e.g., 32–63) to the MCU, provided the volumes are already created
 #svolportlocal_hg_name: "SvolHost1"
 port_wwn_map:
